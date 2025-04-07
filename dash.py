@@ -128,6 +128,59 @@ class AWSRDS_Dashboard:
         except Exception as e:
             st.error(f"Error obteniendo eventos RDS: {e}")
             return pd.DataFrame()
+    
+    def get_cloudwatch_logs(self, session, instance_id, hours=24):
+        """
+        Obtiene los logs de CloudWatch para una instancia RDS específica
+        """
+        try:
+            # Obtener el cliente de CloudWatch Logs
+            logs = session.client('logs')
+            
+            # Calcular el tiempo de inicio y fin
+            end_time = int(datetime.utcnow().timestamp() * 1000)
+            start_time = int((datetime.utcnow() - timedelta(hours=hours)).timestamp() * 1000)
+            
+            # Obtener los grupos de logs relacionados con RDS
+            log_groups = logs.describe_log_groups(
+                logGroupNamePrefix=f'/aws/rds/instance/{instance_id}'
+            )
+            
+            all_logs = []
+            for group in log_groups.get('logGroups', []):
+                group_name = group['logGroupName']
+                
+                # Obtener los streams de logs
+                streams = logs.describe_log_streams(
+                    logGroupName=group_name,
+                    orderBy='LastEventTime',
+                    descending=True
+                )
+                
+                # Obtener los eventos de logs de cada stream
+                for stream in streams.get('logStreams', [])[:5]:  # Limitamos a los 5 streams más recientes
+                    try:
+                        log_events = logs.get_log_events(
+                            logGroupName=group_name,
+                            logStreamName=stream['logStreamName'],
+                            startTime=start_time,
+                            endTime=end_time
+                        )
+                        
+                        for event in log_events['events']:
+                            all_logs.append({
+                                'timestamp': datetime.fromtimestamp(event['timestamp'] / 1000),
+                                'message': event['message'],
+                                'stream': stream['logStreamName']
+                            })
+                    except Exception as e:
+                        st.warning(f"Error obteniendo logs del stream {stream['logStreamName']}: {e}")
+                        continue
+            
+            return pd.DataFrame(all_logs)
+        except Exception as e:
+            st.error(f"Error obteniendo logs de CloudWatch para {instance_id}: {e}")
+            return pd.DataFrame()
 
 def main():
     st.set_page_config(page_title="AWS RDS Monitoring Dashboard", layout="wide")
@@ -181,7 +234,7 @@ def main():
                 
                 # Crear pestañas para diferentes métricas
                 tabs = st.tabs([
-                    "CPU", "Memoria", "Conexiones", "Almacenamiento", "Eventos"
+                    "CPU", "Memoria", "Conexiones", "Almacenamiento", "Eventos", "Logs"
                 ])
                 
                 # Pestaña de CPU
@@ -290,6 +343,42 @@ def main():
                         st.dataframe(events.sort_values(by='Date', ascending=False))
                     else:
                         st.info("No hay eventos recientes para esta instancia.")
+                
+                # Nueva pestaña de Logs (después de la pestaña de Eventos)
+                with tabs[5]:
+                    st.subheader("Logs de CloudWatch")
+                    logs_df = dashboard.get_cloudwatch_logs(session, selected_instance, hours=hours)
+                    
+                    if not logs_df.empty:
+                        # Agregar filtros para los logs
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            selected_streams = st.multiselect(
+                                "Filtrar por Stream",
+                                options=sorted(logs_df['stream'].unique()),
+                                default=sorted(logs_df['stream'].unique())
+                            )
+                        
+                        with col2:
+                            search_term = st.text_input("Buscar en logs", "")
+                        
+                        # Aplicar filtros
+                        filtered_logs = logs_df[logs_df['stream'].isin(selected_streams)]
+                        if search_term:
+                            filtered_logs = filtered_logs[
+                                filtered_logs['message'].str.contains(search_term, case=False, na=False)
+                            ]
+                        
+                        # Mostrar los logs filtrados
+                        st.dataframe(
+                            filtered_logs.sort_values('timestamp', ascending=False),
+                            use_container_width=True
+                        )
+                        
+                        # Mostrar estadísticas básicas
+                        st.metric("Total de logs encontrados", len(filtered_logs))
+                    else:
+                        st.info("No se encontraron logs para esta instancia. Asegúrate de que los logs de CloudWatch estén habilitados para esta instancia RDS.")
             else:
                 st.warning("No se encontraron instancias RDS para este perfil.")
 
