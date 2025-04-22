@@ -4,6 +4,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import sqlite3
+import os
+from rds_database import RDSDatabase
 
 # Predefined AWS Profiles
 AWS_PROFILES = [
@@ -12,9 +15,121 @@ AWS_PROFILES = [
     '+++++++++++++'
 ]
 
+class RDSDatabase:
+    def __init__(self, db_path='rds_history.db'):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize the database and create tables if they don't exist"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create instances table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rds_instances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT,
+                engine TEXT,
+                instance_class TEXT,
+                status TEXT,
+                allocated_storage INTEGER,
+                endpoint TEXT,
+                multi_az INTEGER,
+                publicly_accessible INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create metrics table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rds_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id TEXT,
+                metric_name TEXT,
+                value REAL,
+                timestamp DATETIME,
+                FOREIGN KEY (instance_id) REFERENCES rds_instances(instance_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def store_instances(self, instances_df):
+        """Store RDS instances information"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        for _, row in instances_df.iterrows():
+            cursor.execute('''
+                INSERT INTO rds_instances (
+                    instance_id, engine, instance_class, status,
+                    allocated_storage, endpoint, multi_az, publicly_accessible
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                row['DBInstanceIdentifier'],
+                row['Engine'],
+                row['DBInstanceClass'],
+                row['Status'],
+                row['AllocatedStorage'],
+                row['Endpoint'],
+                int(row['MultiAZ']),
+                int(row['PubliclyAccessible'])
+            ))
+        
+        conn.commit()
+        conn.close()
+    
+    def store_metrics(self, instance_id, metric_name, metrics_df):
+        """Store metrics data"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        for _, row in metrics_df.iterrows():
+            cursor.execute('''
+                INSERT INTO rds_metrics (
+                    instance_id, metric_name, value, timestamp
+                ) VALUES (?, ?, ?, ?)
+            ''', (
+                instance_id,
+                metric_name,
+                row['Value'],
+                row['Timestamp']
+            ))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_historical_instances(self, days=7):
+        """Get historical instances data"""
+        conn = sqlite3.connect(self.db_path)
+        query = '''
+            SELECT * FROM rds_instances 
+            WHERE timestamp >= datetime('now', ?)
+            ORDER BY timestamp DESC
+        '''
+        df = pd.read_sql_query(query, conn, params=[f'-{days} days'])
+        conn.close()
+        return df
+    
+    def get_historical_metrics(self, instance_id, metric_name, days=7):
+        """Get historical metrics data"""
+        conn = sqlite3.connect(self.db_path)
+        query = '''
+            SELECT * FROM rds_metrics 
+            WHERE instance_id = ? AND metric_name = ? 
+            AND timestamp >= datetime('now', ?)
+            ORDER BY timestamp DESC
+        '''
+        df = pd.read_sql_query(query, conn, params=[instance_id, metric_name, f'-{days} days'])
+        conn.close()
+        return df
+
 class AWSRDS_Dashboard:
     def __init__(self):
         self.profiles = sorted(set(AWS_PROFILES))
+        self.db = RDSDatabase()
         
     def get_session_for_profile(self, profile_name):
         """
@@ -183,204 +298,284 @@ class AWSRDS_Dashboard:
             return pd.DataFrame()
 
 def main():
-    st.set_page_config(page_title="AWS RDS Monitoring Dashboard", layout="wide")
+    st.set_page_config(page_title="AWS Monitoring Dashboard", layout="wide")
     
-    dashboard = AWSRDS_Dashboard()
+    # Sidebar menu for dashboard selection
+    st.sidebar.title("Menú Principal")
+    dashboard_type = st.sidebar.radio(
+        "Seleccionar Dashboard",
+        ["Patch Management", "RDS Monitoring"]
+    )
     
-    st.sidebar.title("Configuración")
-    selected_profile = st.sidebar.selectbox("Seleccionar Perfil AWS", dashboard.profiles)
-    
-    st.sidebar.markdown("---")
-    hours = st.sidebar.slider("Periodo de Tiempo (horas)", 1, 72, 24)
-    
-    st.title(f"AWS RDS Monitoring Dashboard")
-    st.markdown(f"Perfil: **{selected_profile}** | Periodo: **{hours} horas**")
-    
-    if st.sidebar.button("Cargar Datos"):
-        session = dashboard.get_session_for_profile(selected_profile)
+    if dashboard_type == "Patch Management":
+        # Aquí iría el código del dashboard de Patch Management
+        st.title("Patch Management Dashboard")
+        st.write("Contenido del dashboard de Patch Management")
         
-        if session:
-            # Obtener instancias RDS
-            instances_df = dashboard.get_rds_instances(session)
+    else:  # RDS Monitoring
+        dashboard = AWSRDS_Dashboard()
+        
+        st.sidebar.title("Configuración RDS")
+        selected_profile = st.sidebar.selectbox("Seleccionar Perfil AWS", dashboard.profiles)
+        
+        st.sidebar.markdown("---")
+        hours = st.sidebar.slider("Periodo de Tiempo (horas)", 1, 72, 24)
+        
+        # Add historical data query section
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Consulta Histórica")
+        historical_query = st.sidebar.checkbox("Mostrar Datos Históricos")
+        
+        if historical_query:
+            # Date range selector
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                start_date = st.date_input("Fecha Inicio")
+            with col2:
+                end_date = st.date_input("Fecha Fin")
             
-            if not instances_df.empty:
-                # Mostrar resumen de instancias en tarjetas
-                st.subheader("Resumen de Instancias RDS")
-                
-                total_instances = len(instances_df)
-                instances_online = instances_df[instances_df['Status'] == 'available'].shape[0]
-                total_storage = instances_df['AllocatedStorage'].sum()
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Instancias Totales", total_instances)
-                with col2:
-                    st.metric("Instancias Online", instances_online)
-                with col3:
-                    st.metric("Almacenamiento Total (GB)", total_storage)
-                
-                # Mostrar tabla de instancias
-                st.subheader("Instancias RDS")
-                st.dataframe(instances_df)
-                
-                # Seleccionar una instancia para métricas detalladas
-                selected_instance = st.selectbox(
-                    "Seleccionar Instancia para Métricas", 
-                    instances_df['DBInstanceIdentifier'].tolist()
+            # Convert dates to datetime
+            start_datetime = datetime.combine(start_date, datetime.min.time())
+            end_datetime = datetime.combine(end_date, datetime.max.time())
+            
+            # Get available instances
+            available_instances = dashboard.db.get_available_instances()
+            if available_instances:
+                selected_instance = st.sidebar.selectbox(
+                    "Seleccionar Instancia",
+                    available_instances
                 )
                 
-                # Mostrar métricas en gráficos
-                st.subheader(f"Métricas de la Instancia: {selected_instance}")
-                
-                # Crear pestañas para diferentes métricas
-                tabs = st.tabs([
-                    "CPU", "Memoria", "Conexiones", "Almacenamiento", "Eventos", "Logs"
-                ])
-                
-                # Pestaña de CPU
-                with tabs[0]:
-                    cpu_metric = dashboard.get_cloudwatch_metrics(
-                        session, selected_instance, 'CPUUtilization', hours=hours
+                # Get available metrics for selected instance
+                available_metrics = dashboard.db.get_available_metrics(selected_instance)
+                if available_metrics:
+                    selected_metric = st.sidebar.selectbox(
+                        "Seleccionar Métrica",
+                        available_metrics
                     )
                     
-                    if not cpu_metric.empty:
-                        fig = px.line(
-                            cpu_metric, 
-                            x='Timestamp', 
-                            y='Value', 
-                            title='Utilización de CPU (%)'
-                        )
-                        fig.update_traces(line_color='#1f77b4')
-                        fig.update_layout(
-                            xaxis_title="Hora",
-                            yaxis_title="CPU (%)",
-                            height=400
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("No hay datos de CPU disponibles para esta instancia.")
-                
-                # Pestaña de Memoria
-                with tabs[1]:
-                    memory_metric = dashboard.get_cloudwatch_metrics(
-                        session, selected_instance, 'FreeableMemory', hours=hours
+                    # Query and display historical data
+                    historical_metrics = dashboard.db.get_historical_metrics(
+                        selected_instance,
+                        selected_metric,
+                        start_datetime,
+                        end_datetime
                     )
                     
-                    if not memory_metric.empty:
-                        # Convertir a GB
-                        memory_metric['Value'] = memory_metric['Value'] / (1024 * 1024 * 1024)
-                        
+                    if not historical_metrics.empty:
+                        st.subheader(f"Historial de {selected_metric} para {selected_instance}")
                         fig = px.line(
-                            memory_metric, 
-                            x='Timestamp', 
-                            y='Value', 
-                            title='Memoria Disponible (GB)'
-                        )
-                        fig.update_traces(line_color='#ff7f0e')
-                        fig.update_layout(
-                            xaxis_title="Hora",
-                            yaxis_title="Memoria (GB)",
-                            height=400
+                            historical_metrics,
+                            x='timestamp',
+                            y='value',
+                            title=f'Historial de {selected_metric}'
                         )
                         st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("No hay datos de memoria disponibles para esta instancia.")
-                
-                # Pestaña de Conexiones
-                with tabs[2]:
-                    conn_metric = dashboard.get_cloudwatch_metrics(
-                        session, selected_instance, 'DatabaseConnections', hours=hours
-                    )
-                    
-                    if not conn_metric.empty:
-                        fig = px.line(
-                            conn_metric, 
-                            x='Timestamp', 
-                            y='Value', 
-                            title='Conexiones a la Base de Datos'
-                        )
-                        fig.update_traces(line_color='#2ca02c')
-                        fig.update_layout(
-                            xaxis_title="Hora",
-                            yaxis_title="Conexiones",
-                            height=400
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("No hay datos de conexiones disponibles para esta instancia.")
-                
-                # Pestaña de Almacenamiento
-                with tabs[3]:
-                    storage_metric = dashboard.get_cloudwatch_metrics(
-                        session, selected_instance, 'FreeStorageSpace', hours=hours
-                    )
-                    
-                    if not storage_metric.empty:
-                        # Convertir a GB
-                        storage_metric['Value'] = storage_metric['Value'] / (1024 * 1024 * 1024)
                         
-                        fig = px.line(
-                            storage_metric, 
-                            x='Timestamp', 
-                            y='Value', 
-                            title='Espacio de Almacenamiento Libre (GB)'
-                        )
-                        fig.update_traces(line_color='#d62728')
-                        fig.update_layout(
-                            xaxis_title="Hora",
-                            yaxis_title="Espacio Libre (GB)",
-                            height=400
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                        # Show raw data
+                        st.subheader("Datos Históricos")
+                        st.dataframe(historical_metrics)
                     else:
-                        st.info("No hay datos de almacenamiento disponibles para esta instancia.")
-                
-                # Pestaña de Eventos
-                with tabs[4]:
-                    events = dashboard.get_rds_events(session, selected_instance)
-                    
-                    if not events.empty:
-                        st.dataframe(events.sort_values(by='Date', ascending=False))
-                    else:
-                        st.info("No hay eventos recientes para esta instancia.")
-                
-                # Nueva pestaña de Logs (después de la pestaña de Eventos)
-                with tabs[5]:
-                    st.subheader("Logs de CloudWatch")
-                    logs_df = dashboard.get_cloudwatch_logs(session, selected_instance, hours=hours)
-                    
-                    if not logs_df.empty:
-                        # Agregar filtros para los logs
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            selected_streams = st.multiselect(
-                                "Filtrar por Stream",
-                                options=sorted(logs_df['stream'].unique()),
-                                default=sorted(logs_df['stream'].unique())
-                            )
-                        
-                        with col2:
-                            search_term = st.text_input("Buscar en logs", "")
-                        
-                        # Aplicar filtros
-                        filtered_logs = logs_df[logs_df['stream'].isin(selected_streams)]
-                        if search_term:
-                            filtered_logs = filtered_logs[
-                                filtered_logs['message'].str.contains(search_term, case=False, na=False)
-                            ]
-                        
-                        # Mostrar los logs filtrados
-                        st.dataframe(
-                            filtered_logs.sort_values('timestamp', ascending=False),
-                            use_container_width=True
-                        )
-                        
-                        # Mostrar estadísticas básicas
-                        st.metric("Total de logs encontrados", len(filtered_logs))
-                    else:
-                        st.info("No se encontraron logs para esta instancia. Asegúrate de que los logs de CloudWatch estén habilitados para esta instancia RDS.")
+                        st.info("No hay datos históricos disponibles para el período seleccionado")
+                else:
+                    st.info("No hay métricas disponibles para la instancia seleccionada")
             else:
-                st.warning("No se encontraron instancias RDS para este perfil.")
+                st.info("No hay instancias disponibles en el histórico")
+        
+        st.title(f"AWS RDS Monitoring Dashboard")
+        st.markdown(f"Perfil: **{selected_profile}** | Periodo: **{hours} horas**")
+        
+        if st.sidebar.button("Cargar Datos"):
+            session = dashboard.get_session_for_profile(selected_profile)
+            
+            if session:
+                # Obtener instancias RDS
+                instances_df = dashboard.get_rds_instances(session)
+                
+                if not instances_df.empty:
+                    # Store instances in database
+                    dashboard.db.store_instances(instances_df)
+                    
+                    # Mostrar resumen de instancias en tarjetas
+                    st.subheader("Resumen de Instancias RDS")
+                    
+                    total_instances = len(instances_df)
+                    instances_online = instances_df[instances_df['Status'] == 'available'].shape[0]
+                    total_storage = instances_df['AllocatedStorage'].sum()
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Instancias Totales", total_instances)
+                    with col2:
+                        st.metric("Instancias Online", instances_online)
+                    with col3:
+                        st.metric("Almacenamiento Total (GB)", total_storage)
+                    
+                    # Mostrar tabla de instancias
+                    st.subheader("Instancias RDS")
+                    st.dataframe(instances_df)
+                    
+                    # Seleccionar una instancia para métricas detalladas
+                    selected_instance = st.selectbox(
+                        "Seleccionar Instancia para Métricas", 
+                        instances_df['DBInstanceIdentifier'].tolist()
+                    )
+                    
+                    # Mostrar métricas en gráficos
+                    st.subheader(f"Métricas de la Instancia: {selected_instance}")
+                    
+                    # Crear pestañas para diferentes métricas
+                    tabs = st.tabs([
+                        "CPU", "Memoria", "Conexiones", "Almacenamiento", "Eventos", "Logs"
+                    ])
+                    
+                    # Pestaña de CPU
+                    with tabs[0]:
+                        cpu_metric = dashboard.get_cloudwatch_metrics(
+                            session, selected_instance, 'CPUUtilization', hours=hours
+                        )
+                        
+                        if not cpu_metric.empty:
+                            # Store metrics in database
+                            dashboard.db.store_metrics(selected_instance, 'CPUUtilization', cpu_metric)
+                            
+                            fig = px.line(
+                                cpu_metric, 
+                                x='Timestamp', 
+                                y='Value', 
+                                title='Utilización de CPU (%)'
+                            )
+                            fig.update_traces(line_color='#1f77b4')
+                            fig.update_layout(
+                                xaxis_title="Hora",
+                                yaxis_title="CPU (%)",
+                                height=400
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No hay datos de CPU disponibles para esta instancia.")
+                    
+                    # Pestaña de Memoria
+                    with tabs[1]:
+                        memory_metric = dashboard.get_cloudwatch_metrics(
+                            session, selected_instance, 'FreeableMemory', hours=hours
+                        )
+                        
+                        if not memory_metric.empty:
+                            # Convertir a GB
+                            memory_metric['Value'] = memory_metric['Value'] / (1024 * 1024 * 1024)
+                            
+                            fig = px.line(
+                                memory_metric, 
+                                x='Timestamp', 
+                                y='Value', 
+                                title='Memoria Disponible (GB)'
+                            )
+                            fig.update_traces(line_color='#ff7f0e')
+                            fig.update_layout(
+                                xaxis_title="Hora",
+                                yaxis_title="Memoria (GB)",
+                                height=400
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No hay datos de memoria disponibles para esta instancia.")
+                    
+                    # Pestaña de Conexiones
+                    with tabs[2]:
+                        conn_metric = dashboard.get_cloudwatch_metrics(
+                            session, selected_instance, 'DatabaseConnections', hours=hours
+                        )
+                        
+                        if not conn_metric.empty:
+                            fig = px.line(
+                                conn_metric, 
+                                x='Timestamp', 
+                                y='Value', 
+                                title='Conexiones a la Base de Datos'
+                            )
+                            fig.update_traces(line_color='#2ca02c')
+                            fig.update_layout(
+                                xaxis_title="Hora",
+                                yaxis_title="Conexiones",
+                                height=400
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No hay datos de conexiones disponibles para esta instancia.")
+                    
+                    # Pestaña de Almacenamiento
+                    with tabs[3]:
+                        storage_metric = dashboard.get_cloudwatch_metrics(
+                            session, selected_instance, 'FreeStorageSpace', hours=hours
+                        )
+                        
+                        if not storage_metric.empty:
+                            # Convertir a GB
+                            storage_metric['Value'] = storage_metric['Value'] / (1024 * 1024 * 1024)
+                            
+                            fig = px.line(
+                                storage_metric, 
+                                x='Timestamp', 
+                                y='Value', 
+                                title='Espacio de Almacenamiento Libre (GB)'
+                            )
+                            fig.update_traces(line_color='#d62728')
+                            fig.update_layout(
+                                xaxis_title="Hora",
+                                yaxis_title="Espacio Libre (GB)",
+                                height=400
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No hay datos de almacenamiento disponibles para esta instancia.")
+                    
+                    # Pestaña de Eventos
+                    with tabs[4]:
+                        events = dashboard.get_rds_events(session, selected_instance)
+                        
+                        if not events.empty:
+                            st.dataframe(events.sort_values(by='Date', ascending=False))
+                        else:
+                            st.info("No hay eventos recientes para esta instancia.")
+                    
+                    # Nueva pestaña de Logs (después de la pestaña de Eventos)
+                    with tabs[5]:
+                        st.subheader("Logs de CloudWatch")
+                        logs_df = dashboard.get_cloudwatch_logs(session, selected_instance, hours=hours)
+                        
+                        if not logs_df.empty:
+                            # Agregar filtros para los logs
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                selected_streams = st.multiselect(
+                                    "Filtrar por Stream",
+                                    options=sorted(logs_df['stream'].unique()),
+                                    default=sorted(logs_df['stream'].unique())
+                                )
+                            
+                            with col2:
+                                search_term = st.text_input("Buscar en logs", "")
+                            
+                            # Aplicar filtros
+                            filtered_logs = logs_df[logs_df['stream'].isin(selected_streams)]
+                            if search_term:
+                                filtered_logs = filtered_logs[
+                                    filtered_logs['message'].str.contains(search_term, case=False, na=False)
+                                ]
+                            
+                            # Mostrar los logs filtrados
+                            st.dataframe(
+                                filtered_logs.sort_values('timestamp', ascending=False),
+                                use_container_width=True
+                            )
+                            
+                            # Mostrar estadísticas básicas
+                            st.metric("Total de logs encontrados", len(filtered_logs))
+                        else:
+                            st.info("No se encontraron logs para esta instancia. Asegúrate de que los logs de CloudWatch estén habilitados para esta instancia RDS.")
+                else:
+                    st.warning("No se encontraron instancias RDS para este perfil.")
 
 if __name__ == "__main__":
     main()
