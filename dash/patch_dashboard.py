@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 import numpy as np
+from auth import login, logout
 
 # Configurar la página
 st.set_page_config(
@@ -13,12 +14,25 @@ st.set_page_config(
     layout="wide"
 )
 
+# Sistema de autenticación
+if 'authentication_status' not in st.session_state:
+    st.session_state.authentication_status = False
+
+# Verificar autenticación
+if not st.session_state.authentication_status:
+    st.session_state.authentication_status = login()
+    if not st.session_state.authentication_status:
+        st.stop()
+
 # Título y descripción
 st.title("🛠️ EC2 Patch Management Dashboard")
 st.markdown("""
 Este dashboard muestra información sobre la instalación de parches en instancias EC2.
 Utiliza los filtros en la barra lateral para analizar los datos específicos.
 """)
+
+# Botón de logout en la barra lateral
+st.sidebar.button("Cerrar Sesión", on_click=logout)
 
 # Conectar a la base de datos
 @st.cache_data
