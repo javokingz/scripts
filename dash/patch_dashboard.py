@@ -1,144 +1,129 @@
 import streamlit as st
-import sqlite3
+import boto3
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime
-import numpy as np
-from auth import login, logout
+import plotly.express as px
 
-# Configurar la página
+# Configuración de la página
 st.set_page_config(
-    page_title="EC2 Patch Management Dashboard",
+    page_title="EC2 Patch Management DynamoDB Dashboard",
     page_icon="🛠️",
     layout="wide"
 )
 
-# Sistema de autenticación
-if 'authentication_status' not in st.session_state:
-    st.session_state.authentication_status = False
-
-# Verificar autenticación
-if not st.session_state.authentication_status:
-    st.session_state.authentication_status = login()
-    if not st.session_state.authentication_status:
-        st.stop()
-
-# Título y descripción
-st.title("🛠️ EC2 Patch Management Dashboard")
+st.title("🛠️ EC2 Patch Management Dashboard (DynamoDB)")
 st.markdown("""
-Este dashboard muestra información sobre la instalación de parches en instancias EC2.
-Utiliza los filtros en la barra lateral para analizar los datos específicos.
+Este dashboard muestra información sobre la instalación de parches en instancias EC2 obtenida desde una tabla DynamoDB.
 """)
 
-# Botón de logout en la barra lateral
-st.sidebar.button("Cerrar Sesión", on_click=logout)
+# Parámetros de conexión
+DYNAMO_TABLE = "<NOMBRE_DE_TU_TABLA>"  # <-- Cambia esto por el nombre real de tu tabla
+REGION_NAME = "us-east-1"  # <-- Cambia esto si tu tabla está en otra región
 
-# Conectar a la base de datos
 @st.cache_data
-def load_data():
-    conn = sqlite3.connect('patches.db')
-    df = pd.read_sql_query("SELECT * FROM patches", conn)
-    conn.close()
-    
-    # Convertir InstalledTime a datetime
-    df['InstalledTime'] = pd.to_datetime(df['InstalledTime'])
-    
+def load_dynamo_data():
+    dynamodb = boto3.resource('dynamodb', region_name=REGION_NAME)
+    table = dynamodb.Table(DYNAMO_TABLE)
+    response = table.scan()
+    data = response.get('Items', [])
+    # Manejar paginación si hay más de 1MB de datos
+    while 'LastEvaluatedKey' in response:
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+        data.extend(response.get('Items', []))
+    df = pd.DataFrame(data)
+    # Convertir fechas
+    if 'CreationDate' in df.columns:
+        df['CreationDate'] = pd.to_datetime(df['CreationDate'], errors='coerce')
+    if 'LastUpdatePatching' in df.columns:
+        df['LastUpdatePatching'] = pd.to_datetime(df['LastUpdatePatching'], errors='coerce')
     return df
 
 # Cargar datos
-df = load_data()
+try:
+    df = load_dynamo_data()
+    st.success(f"Datos cargados correctamente. Total registros: {len(df)}")
+except Exception as e:
+    st.error(f"Error al cargar datos de DynamoDB: {e}")
+    st.stop()
 
-# Sidebar para filtros
+# Filtros en la barra lateral
 st.sidebar.header("Filtros")
+account_ids = ['Todos'] + sorted(df['AccountId'].dropna().unique().tolist())
+selected_account = st.sidebar.selectbox('Cuenta AWS', account_ids)
+plataformas = ['Todas'] + sorted(df['PlataformaName'].dropna().unique().tolist())
+selected_plataforma = st.sidebar.selectbox('Plataforma', plataformas)
+versions = ['Todas'] + sorted(df['PlataformVersion'].dropna().unique().tolist())
+selected_version = st.sidebar.selectbox('Versión de Plataforma', versions)
 
-# Filtros por perfil
-profiles = ['Todos'] + sorted(df['Profile'].unique().tolist())
-selected_profile = st.sidebar.selectbox('Perfil AWS', profiles)
-
-# Filtros por región
-regions = ['Todas'] + sorted(df['Region'].unique().tolist())
-selected_region = st.sidebar.selectbox('Región', regions)
-
-# Filtros por severidad
-severities = ['Todas'] + sorted(df['Severity'].unique().tolist())
-selected_severity = st.sidebar.selectbox('Severidad', severities)
-
-# Filtros por estado
-states = ['Todos'] + sorted(df['State'].unique().tolist())
-selected_state = st.sidebar.selectbox('Estado', states)
-
-# Filtros por fecha
-min_date = df['InstalledTime'].min()
-max_date = df['InstalledTime'].max()
-start_date = st.sidebar.date_input('Fecha inicial', min_date)
-end_date = st.sidebar.date_input('Fecha final', max_date)
+# Filtro por fecha de creación
+if 'CreationDate' in df.columns:
+    min_date = df['CreationDate'].min()
+    max_date = df['CreationDate'].max()
+    start_date = st.sidebar.date_input('Fecha inicial (CreationDate)', min_date)
+    end_date = st.sidebar.date_input('Fecha final (CreationDate)', max_date)
+else:
+    start_date = end_date = None
 
 # Aplicar filtros
 filtered_df = df.copy()
-if selected_profile != 'Todos':
-    filtered_df = filtered_df[filtered_df['Profile'] == selected_profile]
-if selected_region != 'Todas':
-    filtered_df = filtered_df[filtered_df['Region'] == selected_region]
-if selected_severity != 'Todas':
-    filtered_df = filtered_df[filtered_df['Severity'] == selected_severity]
-if selected_state != 'Todos':
-    filtered_df = filtered_df[filtered_df['State'] == selected_state]
-filtered_df = filtered_df[
-    (filtered_df['InstalledTime'].dt.date >= start_date) & 
-    (filtered_df['InstalledTime'].dt.date <= end_date)
-]
+if selected_account != 'Todos':
+    filtered_df = filtered_df[filtered_df['AccountId'] == selected_account]
+if selected_plataforma != 'Todas':
+    filtered_df = filtered_df[filtered_df['PlataformaName'] == selected_plataforma]
+if selected_version != 'Todas':
+    filtered_df = filtered_df[filtered_df['PlataformVersion'] == selected_version]
+if start_date and end_date:
+    filtered_df = filtered_df[(filtered_df['CreationDate'] >= pd.to_datetime(start_date)) & (filtered_df['CreationDate'] <= pd.to_datetime(end_date))]
 
 # Métricas principales
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Total de Parches", len(filtered_df))
+    st.metric("Total de Instancias", filtered_df['instanceId'].nunique())
 with col2:
-    st.metric("Instancias Únicas", filtered_df['Instance_id'].nunique())
+    st.metric("Cuentas Únicas", filtered_df['AccountId'].nunique())
 with col3:
-    st.metric("Cuentas Únicas", filtered_df['Account_id'].nunique())
-with col4:
-    st.metric("KB IDs Únicos", filtered_df['KBId'].nunique())
+    st.metric("Plataformas Únicas", filtered_df['PlataformaName'].nunique())
 
-# Gráfico de distribución de severidad
-st.subheader("Distribución de Severidad de Parches")
-severity_counts = filtered_df['Severity'].value_counts()
-fig_severity = px.pie(
-    values=severity_counts.values,
-    names=severity_counts.index,
-    title="Distribución de Severidad"
-)
-st.plotly_chart(fig_severity, use_container_width=True)
+# Gráficos
+st.subheader("Instancias por Cuenta AWS")
+if not filtered_df.empty:
+    cuenta_counts = filtered_df['AccountId'].value_counts()
+    fig_cuenta = px.bar(
+        x=cuenta_counts.index,
+        y=cuenta_counts.values,
+        labels={'x': 'AccountId', 'y': 'Cantidad de Instancias'},
+        title="Cantidad de Instancias por Cuenta AWS"
+    )
+    st.plotly_chart(fig_cuenta, use_container_width=True)
 
-# Gráfico de parches por región
-st.subheader("Parches por Región")
-region_counts = filtered_df['Region'].value_counts()
-fig_region = px.bar(
-    x=region_counts.index,
-    y=region_counts.values,
-    title="Número de Parches por Región",
-    labels={'x': 'Región', 'y': 'Número de Parches'}
-)
-st.plotly_chart(fig_region, use_container_width=True)
+    st.subheader("Instancias por Plataforma")
+    plataforma_counts = filtered_df['PlataformaName'].value_counts()
+    fig_plataforma = px.pie(
+        values=plataforma_counts.values,
+        names=plataforma_counts.index,
+        title="Distribución por Plataforma"
+    )
+    st.plotly_chart(fig_plataforma, use_container_width=True)
 
-# Gráfico de evolución temporal
-st.subheader("Evolución Temporal de Instalación de Parches")
-daily_patches = filtered_df.groupby(filtered_df['InstalledTime'].dt.date).size()
-fig_temporal = px.line(
-    x=daily_patches.index,
-    y=daily_patches.values,
-    title="Parches Instalados por Día",
-    labels={'x': 'Fecha', 'y': 'Número de Parches'}
-)
-st.plotly_chart(fig_temporal, use_container_width=True)
+    st.subheader("Evolución de Creación de Instancias")
+    if 'CreationDate' in filtered_df.columns:
+        daily = filtered_df.groupby(filtered_df['CreationDate'].dt.date).size()
+        fig_tiempo = px.line(
+            x=daily.index,
+            y=daily.values,
+            labels={'x': 'Fecha', 'y': 'Nuevas Instancias'},
+            title="Instancias creadas por día"
+        )
+        st.plotly_chart(fig_tiempo, use_container_width=True)
+else:
+    st.info("No hay datos para mostrar con los filtros seleccionados.")
 
 # Tabla de datos detallada
-st.subheader("Detalles de Parches")
+st.subheader("Detalles de Instancias")
 st.dataframe(
     filtered_df[[
-        'Profile', 'Region', 'Instance_id', 'Title', 
-        'KBId', 'Classification', 'Severity', 'State', 
-        'InstalledTime'
+        'instanceId', 'AccountId', 'InstanceName', 'PlataformaName',
+        'PlataformVersion', 'CreationDate', 'LastUpdatePatching'
     ]],
     use_container_width=True
 )
@@ -149,10 +134,9 @@ if st.button("Exportar Datos Filtrados"):
     st.download_button(
         label="Descargar CSV",
         data=csv,
-        file_name="patches_data.csv",
+        file_name="dynamo_patches_data.csv",
         mime="text/csv"
     )
 
-# Footer
 st.markdown("---")
-st.markdown("Dashboard creado con Streamlit | Última actualización: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")) 
+st.markdown("Dashboard creado con Streamlit y DynamoDB | Última actualización: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")) 
